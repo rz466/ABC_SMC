@@ -1,0 +1,1493 @@
+---
+title: "ABC-SMC"
+format: html
+editor: visual
+---
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(zellkonverter)
+  library(Matrix)
+  library(SingleCellExperiment)
+  library(ggplot2)
+  library(gridExtra)
+})
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+We want to emulate the scRNA-seq data-generating process:
+
+$$
+z_{ij}\ \xrightarrow[\text{scRNA-seq measurement}]{t_{ij}}\ x_{ij}.
+$$
+
+Let $i=1,\dots,N$ index cells and $j=1,\dots,J$ index genes. There are two steps:
+
+1.  Generate latent true expression $z_{ij}\ge 0$ from a biological model (with on/off state and biological variability).
+
+2.  Generate observed scRNA-seq expression (UMI counts) $x_{ij}\ge0$ from an scRNA-seq measurement model (with technical variability).
+
+## **1. Simulator Model**
+
+### **1.1 Overview**
+
+Hyperparameters: $$
+\lambda=(\theta,\gamma,\rho,\alpha,\sigma^2,\alpha_\psi,\beta_\psi,\alpha_\phi,\beta_\phi).
+$$
+
+Let the total number of genes be $J$, where genes $1,\dots,K$ are transcription factors (TFs) that act as regulators. All $J$ genes may serve as regulatory targets, while genes $K+1,\dots,J$ are non-TF genes.
+
+Let $u_{ij} \in [0, 1]$ act as the continuous perturbation indicator for gene $j$ in cell $i$, representing the degree of knockdown. Within each simulation, compute the perturbation-aware regulatory means:
+
+$$
+m_{ij}=\exp\left(\sum_{k=1}^K \beta_{ikj}^{\prime}a_{ik}\right) 
+$$ with TF activities of regulator $k$:\
+$$
+a_{ik}\sim\text{Gamma}(\alpha,\alpha)
+$$ and regulatory effect $$
+\beta_{ikj}^{\prime} = \beta_{kj} \ (1 - u_{ik}), \quad \beta_{kj}= \delta_{kj} \dot{\beta}_{kj}, \quad \dot{\beta}_{kj}\sim\mathcal N(0,\sigma^2).
+$$
+
+$$
+\delta_{kj}\mid\psi_k,\phi_j \sim\operatorname{Bernoulli}(\psi_k\phi_j), \quad \psi_k \sim\operatorname{Beta}(\alpha_\psi,\beta_\psi), \quad \phi_j \sim\operatorname{Beta}(\alpha_\phi,\beta_\phi)
+$$
+
+Define gene-specific gene-on probabilities: $$
+\pi_j\sim \text{Beta}(\theta,\ (1-\theta)),\quad \theta \in (0,1)
+$$ Then, generating the latent state and applying the target perturbation mask: $$
+v_{ij} \ | \ \pi_j\sim \text{Bernoulli}(\pi_j),\qquad z_{ij}= \begin{cases} 0,& v_{ij}=0\\ \text{Gamma}(m_{ij}\gamma,\gamma),& v_{ij}=1 \end{cases}, \qquad z_{ij}^{\prime} = z_{ij} \ (1 - u_{ij})
+$$ $$
+t_{ij}\sim\text{Gamma}(\rho,\rho),\qquad x_{ij}\mid z_{ij}^{\prime},t_{ij}\sim\text{Poisson}(t_{ij}z_{ij}^{\prime})
+$$
+
+### **1.2 Biological Model for Latent True Expression** $z_{ij}$
+
+#### **1.2.1 Regulatory model for** $m_{ij}$
+
+To account for continuous perturbations, we define a cell-specific masked regulatory effect $\beta_{ikj}^{\prime}$: $$
+\beta_{ikj}^{\prime} = \beta_{kj} \  (1 - u_{ik}), \quad i=1, \dots, N.
+$$
+
+This ensures that if regulator $k$ is partially or fully knocked down in cell $i$, its regulatory effect on downstream genes scales proportionally. We then define the regulatory mean as:
+
+$$
+m_{ij}=\exp\left(\sum_{k=1}^K \beta_{ikj}^{\prime}a_{ik}\right)  
+$$
+
+with:
+
+-   $a_{ik}\ge 0$ denoting the TF activities of regulator $k$ in cell $i$, such that: $$
+      a_{ik}\sim \text{Gamma}(\alpha,\alpha)\quad\Rightarrow\quad \mathbb E[a_{ik}]=1,\ \quad \text{Var}(a_{ik})=\frac{1}{\alpha}.
+    $$
+
+-   $\delta_{kj}$ denoting the binary adjacency matrix, such that:
+
+    $$
+    \delta_{kj}\mid\psi_k,\phi_j \sim\operatorname{Bernoulli}(\psi_k\phi_j),
+    $$
+
+    where the regulator-specific and target-specific edge propensities satisfy $$\psi_k\sim\operatorname{Beta}(\alpha_\psi,\beta_\psi),
+    \qquad k=1,\ldots,K, \quad \text{and} \quad \phi_j\sim\operatorname{Beta}(\alpha_\phi,\beta_\phi),
+    \qquad j=1,\ldots,J.$$
+
+    Here,
+
+    $$
+    \delta_{kj} = \begin{cases} 1, & \text{regulator } k \text{ regulates target } j, \\ 0, & \text{otherwise.} \end{cases}
+    $$
+
+-   $\dot{\beta}_{kj}$ denoting the signed regulatory effect of regulator $k$ on gene $j$, such that: $$
+    \dot{\beta}_{kj}\sim\mathcal N(0,\sigma^2).
+    $$
+
+    This yields the regulatory effect: $$
+    \beta_{kj}= \delta_{kj}\dot{\beta}_{kj}
+    $$
+
+#### **1.2.2 On/Off States** $v_{ij}$ **and Perturbation Scaling**
+
+We conceptualize the latent true expression $z_{ij}^{\prime}$ as being governed by the intersection of a binary biological switch and a continuous experimental knockdown. This ensures that a gene only displays expression if it is biologically on, and that the magnitude of this expression is modulated by the efficiency of the CRISPR perturbation.
+
+##### **1.2.2.1 The Biological Switch (**$v_{ij}$**)**
+
+This represents the natural transcriptional state of gene $j$ in cell $i$. We introduce a global hyperparameter $\theta \in (0,1)$ to define the gene-specific on-probability $\pi_j$:
+
+$$
+\pi_j\sim \text{Beta}(\theta,\ (1-\theta))\quad\Rightarrow\quad \mathbb E[\pi_j]=\theta,\ \quad 
+\mathrm{Var}(\pi_j)=\frac{\theta(1-\theta)}{2}.
+$$
+
+The biological state is then sampled as:
+
+$$
+v_{ij}\sim \mathrm{Bernoulli}(\pi_j).
+$$
+
+-   $v_{ij} = 1$: The gene is biologically on.
+
+-   $v_{ij} = 0$: The gene is biologically off.
+
+##### **1.2.2.2 The Perturbation Scaling (**$u_{ij}$**)**
+
+Unlike a binary knockout, the experimental intervention is modeled as a continuous knockdown fraction $u_{ij} \in [0, 1]$. This represents the proportion of expression lost due to the perturbation:
+
+-   $u_{ij} = 0$: No perturbation (100% of biological activity remains).
+
+-   $0 < u_{ij} < 1$: Partial knockdown (e.g., $u_{ij} = 0.9$ implies 10% residual activity).
+
+-   $u_{ij} = 1$: Complete knockout (0% of biological activity remains).
+
+##### **1.2.2.3 Latent Expression Logic**
+
+To implement the perturbation on the target gene, we define the masked latent expression $z_{ij}^{\prime}$ by scaling the theoretical biological latent state $z_{ij}$ by the residual activity $(1 - u_{ij})$:
+
+1.  Case 1: $z_{ij}^{\prime} = 0$ if $v_{ij} = 0$
+
+    If the biological switch is off, the gene cannot be expressed regardless of the perturbation state.
+
+$$
+\Pr(z_{ij}^{\prime}=0\mid v_{ij}=0)=1,\qquad \Pr(z_{ij}^{\prime}\neq 0\mid v_{ij}=0)=0
+$$
+
+2.  Case 2: $z_{ij}^{\prime} \ge 0$ if $v_{ij} = 1$
+
+    If the gene is biologically on, its latent expression is sampled from a Gamma distribution centered around the regulatory mean $m_{ij}$, then scaled by the knockdown factor $(1 - u_{ij})$:
+
+    $$
+    z_{ij}^{\prime}\mid (v_{ij}=1)\ \sim\ \text{Gamma}(m_{ij}\gamma,\ \gamma) \ (1 - u_{ij})
+    $$
+
+    where $\gamma > 0$ represents biological variability. Under this parameterization, the conditional mean and variance of the masked expression are:
+
+$$
+\mathbb{E}[z_{ij}^{\prime}\mid v_{ij}=1]=m_{ij}(1 - u_{ij}),\qquad \text{Var}(z_{ij}^{\prime}\mid v_{ij}=1)=\frac{m_{ij}(1 - u_{ij})^2}{\gamma}.
+$$
+
+### **1.3 Observed scRNA-seq Count** $x_{ij}$
+
+We map the masked latent true expression $z_{ij}^{\prime}$ to the observed UMI count: $$
+x_{ij}\mid z_{ij}^{\prime},t_{ij}\sim\text{Poisson}(t_{ij}z_{ij}^{\prime})
+$$ with $t_{ij}$ denoting technical variability, which is modeled by a Gamma prior: $$
+  t_{ij}\sim\text{Gamma}(\rho,\rho)\quad\Rightarrow\quad 
+  \mathbb{E}[t_{ij}] = 1,\qquad \mathrm{Var}(t_{ij}) = \frac{1}{\rho}. 
+$$
+
+Here, $\rho$ controls the magnitude of the technical noise. Because the perturbation is directly baked into $z_{ij}^{\prime}$, any cell where a gene is knocked out will have $z_{ij}^{\prime}=0$. Consequently, the Poisson rate ($t_{ij} \cdot 0$) becomes exactly 0, guaranteeing that the observed UMI count $x_{ij} = 0$ for that knockout target.
+
+## **2. Summary Statistics**
+
+### **2.1 Entry-specific summaries**
+
+Given an observed UMI count matrix $X_{\text{obs}} \in \mathbb{R}^{N\times J}$, we summarize the marginal distribution of entrywise counts by considering the vector of all entries
+
+$$
+x_\text{all} = (X_{ij} : i=1,...,N,\ j=1,...,J).
+$$
+
+Because scRNA-seq matrices are often highly zero-inflated, we additionally summarize the distribution of positive counts only:
+
+$$
+x_\text{nonzero} = (X_{ij} : X_{ij} > 0).
+$$
+
+### **2.2 Cell-specific summaries**
+
+To preserve variation across cells on a scale comparable across datasets, we use the mean UMI count per gene in each cell:
+
+$$
+\bar C_i = \frac{1}{J}\sum_{j=1}^J X_{ij},\qquad i=1,\dots,N.
+$$
+
+We also summarize the fraction of detected genes (nonzero genes) per cell:
+
+$$
+\bar D_i = \frac{1}{J}\sum_{j=1}^{J} \mathbf{1}\{X_{ij} > 0\}, \qquad i=1,\dots,N,
+$$
+
+and let $C=(\bar C_i)_{i=1}^N$ and $D=(\bar D_i)_{i=1}^N$.
+
+### **2.3 Gene-specific summaries**
+
+To also preserve variation across genes on a comparable scale, we use the mean UMI count per cell for each gene:
+
+$$
+\bar G_j = \frac{1}{N}\sum_{i=1}^N X_{ij},\qquad j=1,\dots,J.
+$$
+
+We also summarize the fraction of cells expressing each gene:
+
+$$
+\bar M_j = \frac{1}{N}\sum_{i=1}^N \mathbf{1}\{X_{ij}>0\},\qquad j=1,\dots,J,
+$$
+
+and let $G=(\bar G_j)_{j=1}^J$ and $M=(\bar M_j)_{j=1}^J$.
+
+### **2.4 Quantile summaries**
+
+We combine these distributions into a single summary vector $S(X)$ by taking selected quantiles from each component. Let
+
+$$
+P= \{0.1, 0.2, 0.3,0.4,0.5, 0.6, 0.7,0.8,0.9\}.
+$$
+
+For any vector $v$, let $Q_v(p)$ denote the $p$-th quantile of the entries of $v$, and let $Q_v(P)=(Q_v(p):p\in P)$. The final summary vector is
+
+$$
+S(X) = \Bigl( Q_{x_{\text{all}}}(P),\; Q_{x_{\text{nonzero}}}(P),\; Q_{C}(P),\; Q_{D}(P),\; Q_{G}(P),\; Q_{M}(P) \Bigr).
+$$
+
+For a simulated dataset $X_\text{sim}$, we compute $S_\text{sim} = S(X_\text{sim})$ and compare it to the observed summary $S_\text{obs}=S(X_\text{obs})$ within the Approximate Bayesian Computation procedure.
+
+## **3. Prior**
+
+We start by choosing a prior over hyperparameters
+
+$$
+\lambda=(\theta,\gamma,\rho,\alpha,\sigma^2,\alpha_\psi,\beta_\psi,\alpha_\phi,\beta_\phi).
+$$
+
+to reflect plausible ranges for each mechanism in the simulator (on/off, biological variability, technical variability, activity variability, effect sizes, regulator-specific edge propensity, and target-specific edge propensity).
+
+-   Overall fraction of probability that a gene is on
+
+$$
+\theta \sim \text{Uniform}(0.05,\;0.95).
+$$
+
+-   Biological Gamma concentration
+
+$$
+\log \gamma \sim \text{Uniform}(\log 1.5,\;\log 25).
+$$
+
+-   Technical Gamma concentration
+
+$$
+\log \rho \sim \text{Uniform}(\log 10,\;\log 60).
+$$
+
+-   Multiplicative TF-activity Gamma concentration
+
+$$
+\log \alpha \sim \text{Uniform}(\log 2,\;\log 20).
+$$
+
+-   Effect variance
+
+$$
+\log \sigma^2 \sim \text{Uniform}(0.05,\;0.15)
+$$
+
+-   Regulator-specific edge-propensity Beta shape hyperparameters
+
+    $$
+    \log\alpha_\psi\sim\operatorname{Uniform}(\log 0.1,\log 5),
+    $$
+
+    $$
+    \log\beta_\psi\sim\operatorname{Uniform}(\log 0.1,\log 10).
+    $$
+
+-   Target-specific edge-propensity Beta shape hyperparameters
+
+    $$
+    \log\alpha_\phi\sim\operatorname{Uniform}(\log 0.1,\log 5),
+    $$
+
+    $$
+    \log\beta_\phi\sim\operatorname{Uniform}(\log 0.1,\log 10).
+    $$
+
+For each sampled $\lambda$, we generate a simulated dataset ${X}_{\text{sim}}$ using Sections 1-2.
+
+## **4. ABC-SMC**
+
+We infer $\lambda=(\theta,\gamma,\rho,\alpha,\sigma^2,\alpha_\psi,\beta_\psi,\alpha_\phi,\beta_\phi)$ using an Approximate Bayesian Computation Sequential Monte Carlo (ABC-SMC) procedure, following Castro (2025). The goal is to approximate the posterior distribution of $\lambda$ by evolving a sequence of particle populations whose simulated summary statistics become progressively closer to the observed summaries.
+
+At each stage, we compare the simulated and observed summaries using the Euclidean discrepancy
+
+$$
+d(\lambda)\;=\;\bigl\|S_{\text{sim}}-S_{\text{obs}}\bigr\|_2,
+$$
+
+where $S_{\text{sim}}=S(X_{\text{sim}})$ and $S_{\text{obs}}=S(X_{\text{obs}})$.
+
+We use
+
+$$W=200$$
+
+particles per population and run $T=5$ ABC-SMC populations.
+
+### **4.1 First population**
+
+For the first population, we generate particles using rejection ABC. First, we draw a pilot sample of hyperparameter values from the prior and use their distances to determine the initial tolerance $\epsilon_1$. Specifically, we simulate a pilot set of size
+
+$$
+Q_{\text{pilot}} = 2,000,
+$$
+
+compute the corresponding distances, and set $\epsilon_1$ to the 0.25-quantile of the pilot distance distribution, that is,
+
+$$
+\varepsilon_1 = Q_{0.25}(d^{(1)},\dots,d^{(Q_{\text{pilot}})}).
+$$
+
+We then repeatedly:
+
+1.  sample $\lambda \sim \pi(\lambda)$ from the prior,
+
+2.  simulate $X_{\text{sim}}$,
+
+3.  compute $S_{\text{sim}}$ and $d(\lambda)$,
+
+4.  accept $\lambda$ if
+
+    $$
+    d(\lambda)\le \varepsilon_1.
+    $$
+
+This process continues until exactly $W=200$ particles are accepted. All particles in the first population are assigned equal weights.
+
+### **4.2 Later populations**
+
+For each later population $t=2,\dots,T$, we update the tolerance automatically using the accepted distances $d_{t-1}^{(1)},\dots,d_{t-1}^{(W)}$ from the previous population $t-1$. Specifically, we set
+
+$$
+\varepsilon_t = Q_{0.25}(d_{t-1}^{(1)},\dots,d_{t-1}^{(W)}),
+$$
+
+so that the tolerance is decreased adaptively across populations rather than fixed in advance.
+
+To generate the $t$-th population, we repeatedly:
+
+1.  sample one particle from the previous population with probability proportional to its weight,
+
+2.  perturb it using a multivariate Gaussian kernel,
+
+3.  reject immediately if the perturbed hyperparameter falls outside the allowed prior ranges,
+
+4.  simulate $X_{\text{sim}}$ from the proposed hyperparameter,
+
+5.  compute $S_{\text{sim}}$ and $d(\lambda)$,
+
+6.  accept the proposal if
+
+    $$
+    d(\lambda)\le \varepsilon_t.
+    $$
+
+We continue until exactly $W=200$ particles are accepted in that population.
+
+### **4.3 Gaussian perturbation kernel and weights**
+
+For population $t \ge 2$, we first select a parent particle $\lambda^*$ from the previous population with probability proportional to its weight, and then perturb it using a multivariate Gaussian random-walk kernel on the transformed hyperparameter scale. Let $\Sigma_{t-1}$ denote the weighted empirical covariance matrix of the transformed particles in population $t-1$. We propose a new particle $\lambda$ from
+
+$$
+K_t(\lambda \mid \lambda^*) = \mathcal N(\lambda^*,\, 2\Sigma_{t-1}),
+$$
+
+so that the proposal is centered at the parent particle $\lambda^*$, and its covariance is tuned to the spread of the previous particle population. The factor 2 slightly enlarges the proposal covariance relative to the empirical particle covariance, allowing broader local exploration.
+
+After acceptance, particles are assigned importance weights. In the first population, all accepted particles are assigned equal weights. For populations $t \ge 2,$ the weight of accepted particle $\lambda_t^{(m)}$ is updated by
+
+$$
+w_t^{(m)} \propto \frac{\pi(\lambda_t^{(m)})}{ \sum_{\ell=1}^W w_{t-1}^{(\ell)}\,K_t\!\left(\lambda_t^{(m)} \mid \lambda_{t-1}^{(\ell)}\right) }.$$
+
+where $\pi(\lambda_t^{(m)})$ is the prior density of the accepted particle, $w_{t-1}^{(\ell)}$ is the normalized weight of particle $\ell$ in the previous population, and $K_t(\lambda_t^{(m)} \mid \lambda_{t-1}^{(\ell)})$ is the proposal density from previous particle $\ell$ to the accepted particle $\lambda_t^{(m)}$. The weights are then normalized to sum to one within each population.
+
+### **4.4 ESS and resampling**
+
+At each population, we monitor the effective sample size (ESS),
+
+$$
+\mathrm{ESS} = \frac{1}{\sum_{m=1}^W (w_t^{(m)})^2},
+$$
+
+as a diagnostic for particle degeneracy. If the ESS falls below half of the particle count, we resample the accepted particles and reset their weights to be uniform.
+
+### **4.5 Final posterior and posterior predictive checks**
+
+After the final population $T=5,$ we take the last weighted particle population as the ABC-SMC approximation to the posterior distribution of
+
+$$
+\lambda=(\theta,\gamma,\rho,\alpha,\sigma^2,\alpha_\psi,\beta_\psi,\alpha_\phi,\beta_\phi).
+$$
+
+Using the accepted particles from the final population, we generate posterior predictive datasets and compare their distributions with $X_{\text{obs}}$.
+
+```{r}
+norman <- readH5AD("/Users/zhangrui/Desktop/precmat/Norman_2019.h5ad", 
+                   reader = "R", use_hdf5 = TRUE)
+
+# Single-gene perturbations = regulators
+pert_all <- as.character(colData(norman)$perturbation_name)
+regulator_gene_names <- sort(unique(pert_all[!is.na(pert_all) & pert_all != "control" &
+                                               !grepl("\\+", pert_all)]))
+
+# Control-cell raw UMI matrix
+sce_control <- norman[, colData(norman)$perturbation_name == "control"]
+X_real <- assay(sce_control, "counts")
+
+# Match regulators to expression matrix
+regulator_gene_idx <- match(regulator_gene_names, rownames(X_real))
+regulator_gene_idx <- regulator_gene_idx[!is.na(regulator_gene_idx)]
+
+# Subsample
+set.seed(1)
+
+N_use <- 300
+J_use <- 200
+K_use <- 40
+
+regulator_use <- sample(regulator_gene_idx, K_use)
+
+non_regulator <- setdiff(seq_len(nrow(X_real)), regulator_gene_idx)
+other_genes <- sample(non_regulator, J_use - K_use)
+
+genes_use <- sample(c(regulator_use, other_genes))
+cells_use <- sample(seq_len(ncol(X_real)), N_use)
+
+# N x J raw UMI matrix
+X_obs <- as.matrix(t(X_real[genes_use, cells_use, drop = FALSE]))
+
+cat("Observed matrix dimension N x J:", dim(X_obs), "\n")
+```
+
+```{r}
+# 1) Summary statistics for ABC
+summaries <- function(X) {
+
+  x_all <- as.vector(X)
+  x_nonzero <- x_all[x_all > 0 & !is.na(x_all)]
+
+  if (length(x_nonzero) == 0 || any(!is.finite(x_all))) {
+    return(rep(NA, 54))
+  }
+
+  C_i <- rowMeans(X)
+  D_i <- rowMeans(X > 0)
+  G_j <- colMeans(X)
+  M_j <- colMeans(X > 0)
+
+  probs_use <- c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+
+  c(
+    quantile(x_all, probs = probs_use, na.rm = TRUE, names = FALSE),
+    quantile(x_nonzero, probs = probs_use, na.rm = TRUE, names = FALSE),
+    quantile(C_i, probs = probs_use, na.rm = TRUE, names = FALSE),
+    quantile(D_i, probs = probs_use, na.rm = TRUE, names = FALSE),
+    quantile(G_j, probs = probs_use, na.rm = TRUE, names = FALSE),
+    quantile(M_j, probs = probs_use, na.rm = TRUE, names = FALSE)
+  )
+}
+
+S_obs <- summaries(X_obs)
+
+# 2) ABC distance
+distance_abc <- function(S_sim, S_obs) {
+  d <- sqrt(sum((S_sim - S_obs)^2))
+
+  # If distance is NA, return Infinity to force rejection
+  if (!is.finite(d)) {
+    return(Inf)
+  }
+
+  d
+}
+
+# 3) Prior ranges
+prior_range <- list(
+  theta = c(0.05, 0.95),
+  gamma = c(1.5, 25),
+  rho = c(10, 60),
+  alpha = c(2, 20),
+  sigma2 = c(0.05, 0.15),
+  alpha_phi = c(0.1, 5),
+  beta_phi = c(0.1, 10),
+  alpha_psi = c(0.1, 5),
+  beta_psi = c(0.1, 10)
+)
+
+# Sample one hyperparameter from its prior
+sample_lambda <- function() {
+  list(
+    # Uniform prior
+    theta = runif(1, min = prior_range$theta[1], max = prior_range$theta[2]),
+
+    # Log-uniform priors
+    gamma = exp(runif(1, min = log(prior_range$gamma[1]), max = log(prior_range$gamma[2]))),
+    rho = exp(runif(1, min = log(prior_range$rho[1]), max = log(prior_range$rho[2]))),
+    alpha = exp(runif(1, min = log(prior_range$alpha[1]), max = log(prior_range$alpha[2]))),
+    sigma2 = exp(runif(1, min = log(prior_range$sigma2[1]), max = log(prior_range$sigma2[2]))),
+    alpha_phi = exp(runif(1, min = log(prior_range$alpha_phi[1]), 
+                          max = log(prior_range$alpha_phi[2]))),
+    beta_phi = exp(runif(1, min = log(prior_range$beta_phi[1]), 
+                         max = log(prior_range$beta_phi[2]))),
+    alpha_psi = exp(runif(1, min = log(prior_range$alpha_psi[1]), 
+                          max = log(prior_range$alpha_psi[2]))),
+    beta_psi = exp(runif(1, min = log(prior_range$beta_psi[1]),
+                         max = log(prior_range$beta_psi[2])))
+  )
+}
+
+# 4) Prior density
+prior_density <- function(lambda) {
+
+  inside_support <- (
+    lambda$theta >= prior_range$theta[1] &&
+      lambda$theta <= prior_range$theta[2] &&
+    lambda$gamma >= prior_range$gamma[1] &&
+      lambda$gamma <= prior_range$gamma[2] &&
+    lambda$rho >= prior_range$rho[1] &&
+      lambda$rho <= prior_range$rho[2] &&
+    lambda$alpha >= prior_range$alpha[1] &&
+      lambda$alpha <= prior_range$alpha[2] &&
+    lambda$sigma2 >= prior_range$sigma2[1] &&
+      lambda$sigma2 <= prior_range$sigma2[2] &&
+    lambda$alpha_phi >= prior_range$alpha_phi[1] &&
+      lambda$alpha_phi <= prior_range$alpha_phi[2] &&
+    lambda$beta_phi >= prior_range$beta_phi[1] &&
+      lambda$beta_phi <= prior_range$beta_phi[2] &&
+    lambda$alpha_psi >= prior_range$alpha_psi[1] &&
+      lambda$alpha_psi <= prior_range$alpha_psi[2] &&
+    lambda$beta_psi >= prior_range$beta_psi[1] &&
+      lambda$beta_psi <= prior_range$beta_psi[2]
+  )
+
+  if (!inside_support) {
+    return(0)
+  }
+
+  d_theta <- 1 / (prior_range$theta[2] - prior_range$theta[1])
+  d_log_gamma <- 1 / (log(prior_range$gamma[2]) - log(prior_range$gamma[1]))
+  d_log_rho <- 1 / (log(prior_range$rho[2]) - log(prior_range$rho[1]))
+  d_log_alpha <- 1 / (log(prior_range$alpha[2]) - log(prior_range$alpha[1]))
+  d_log_sigma2 <- 1 / (log(prior_range$sigma2[2]) - log(prior_range$sigma2[1]))
+  d_log_alpha_phi <- 1 / (log(prior_range$alpha_phi[2]) - log(prior_range$alpha_phi[1]))
+  d_log_beta_phi <- 1 / (log(prior_range$beta_phi[2]) - log(prior_range$beta_phi[1]))
+  d_log_alpha_psi <- 1 / (log(prior_range$alpha_psi[2]) - log(prior_range$alpha_psi[1]))
+  d_log_beta_psi <- 1 / (log(prior_range$beta_psi[2]) - log(prior_range$beta_psi[1]))
+
+  d_theta * d_log_gamma * d_log_rho * d_log_alpha * d_log_sigma2 * d_log_alpha_phi * d_log_beta_phi * d_log_alpha_psi * d_log_beta_psi
+}
+
+# check hyperparameter vector inside support of prior
+in_prior_support <- function(theta) {
+  prior_density(theta) > 0
+}
+
+# 5) Simulator
+simulate_X_from_lambda <- function(lambda, N, J, K) {
+
+  # hyperparameters
+  theta <- lambda$theta
+  gamma <- lambda$gamma
+  rho <- lambda$rho
+  alpha <- lambda$alpha
+  sigma2 <- lambda$sigma2
+  alpha_phi <- lambda$alpha_phi
+  beta_phi <- lambda$beta_phi
+  alpha_psi <- lambda$alpha_psi
+  beta_psi <- lambda$beta_psi
+
+  # (a) TF activity a_ik
+  a_ik <- matrix(rgamma(N * K, shape = alpha, rate = alpha), nrow = N, ncol = K)
+
+  # (b) TF -> gene effects: beta_kj ~ Normal(0, sigma2)
+  beta_kj <- matrix(rnorm(K * J, mean = 0, sd = sqrt(sigma2)), nrow = K, ncol = J)
+
+  # (c) delta_kj ~ Bernoulli(phi_j * psi_k)
+  phi_j <- rbeta(J, shape1 = alpha_phi, shape2 = beta_phi)
+  psi_k <- rbeta(K, shape1 = alpha_psi, shape2 = beta_psi)
+  prob_kj <- outer(psi_k, phi_j, "*")
+  delta_kj <- matrix(rbinom(K * J, size = 1, prob = as.vector(prob_kj)), nrow = K, ncol = J)
+  
+  beta_kj <- beta_kj * delta_kj
+
+  # (d) Mean expression: m_ij = exp(sum_k a_ik * beta_kj)
+  m_ij <- exp(a_ik %*% beta_kj)
+
+  # (e) Gene-specific on-probabilities
+  shape1 <- theta
+  shape2 <- (1 - theta)
+  pi_j <- rbeta(J, shape1 = shape1, shape2 = shape2)
+
+  # On/off states: v_ij ~ Bernoulli(pi_j)
+  v_ij <- matrix(
+    rbinom(N * J, size = 1, prob = rep(pi_j, each = N)),
+    nrow = N, ncol = J
+  )
+
+  # (f) Biological expression
+  z_ij <- matrix(0, nrow = N, ncol = J)
+  idx_on <- which(v_ij == 1, arr.ind = TRUE)
+
+  if (nrow(idx_on) > 0) {
+    shape_vec <- m_ij[idx_on] * gamma
+    z_ij[idx_on] <- rgamma(nrow(idx_on), shape = shape_vec, rate = gamma)
+  }
+
+  # (g) Technical multiplicative noise: t_ij ~ Gamma(rho, rho)
+  t_ij <- matrix(rgamma(N * J, shape = rho, rate = rho), nrow = N, ncol = J)
+
+  # (h) Observation: X_ij | z_ij, t_ij ~ Poisson(t_ij * z_ij)
+  lambda_ij <- t_ij * z_ij
+  X_ij <- matrix(rpois(N * J, lambda = as.vector(lambda_ij)), nrow = N, ncol = J)
+
+  list(
+    X = X_ij,
+    a = a_ik,
+    beta = beta_kj,
+    delta = delta_kj,
+    m = m_ij,
+    v = v_ij,
+    z = z_ij,
+    t = t_ij,
+    pi_j = pi_j,
+    phi_j = phi_j,
+    psi_k = psi_k
+  )
+}
+```
+
+```{r}
+# Convert lambda to numeric vector
+lambda_to_vec <- function(lambda) {
+  c(
+    theta = lambda$theta,
+    log_gamma = log(lambda$gamma),
+    log_rho = log(lambda$rho),
+    log_alpha = log(lambda$alpha),
+    log_sigma2 = log(lambda$sigma2),
+    log_alpha_phi = log(lambda$alpha_phi),
+    log_beta_phi = log(lambda$beta_phi),
+    log_alpha_psi = log(lambda$alpha_psi),
+    log_beta_psi = log(lambda$beta_psi)
+  )
+}
+
+# Convert back
+vec_to_lambda <- function(v) {
+  list(
+    theta = unname(v["theta"]),
+    gamma = exp(unname(v["log_gamma"])),
+    rho = exp(unname(v["log_rho"])),
+    alpha = exp(unname(v["log_alpha"])),
+    sigma2 = exp(unname(v["log_sigma2"])),
+    alpha_phi = exp(unname(v["log_alpha_phi"])),
+    beta_phi = exp(unname(v["log_beta_phi"])),
+    alpha_psi = exp(unname(v["log_alpha_psi"])),
+    beta_psi = exp(unname(v["log_beta_psi"]))
+  )
+}
+
+# Compute the weighted covariance matrix of the particles
+weighted_covariance <- function(X, w) {
+  mu <- colSums(X * w)
+  Xc <- sweep(X, 2, mu, "-")
+  crossprod(Xc * sqrt(w), Xc * sqrt(w))
+}
+
+# Stabilize covariance matrix so chol() does not fail
+make_positive_definite <- function(Sigma, min_eig = 1e-8) {
+
+  Sigma <- as.matrix(Sigma)
+  Sigma[!is.finite(Sigma)] <- 0
+
+  # Force symmetry
+  Sigma <- (Sigma + t(Sigma)) / 2
+
+  eig_vals <- eigen(Sigma, symmetric = TRUE, only.values = TRUE)$values
+  min_val <- min(eig_vals, na.rm = TRUE)
+
+  if (!is.finite(min_val)) {
+    return(diag(min_eig, nrow(Sigma)))
+  }
+
+  if (min_val < min_eig) {
+    diag(Sigma) <- diag(Sigma) + (min_eig - min_val)
+  }
+
+  # Force symmetry again after diagonal adjustment
+  Sigma <- (Sigma + t(Sigma)) / 2
+
+  Sigma
+}
+
+# Compute the log density of a multivariate Gaussian distribution
+mvnorm_logpdf <- function(x, mean, Sigma) {
+
+  Sigma <- make_positive_definite(Sigma, min_eig = 1e-8)
+
+  p <- length(x)
+
+  cholS <- tryCatch(
+    chol(Sigma),
+    error = function(e) {
+      chol(make_positive_definite(Sigma, min_eig = 1e-6))
+    }
+  )
+
+  z <- backsolve(cholS, x - mean, transpose = TRUE)
+
+  out <- -0.5 * (
+    p * log(2 * pi) +
+      2 * sum(log(diag(cholS))) +
+      sum(z^2)
+  )
+
+  if (!is.finite(out)) {
+    return(-Inf)
+  }
+
+  out
+}
+
+# Take one old particle and perturb it with a Gaussian random walk
+perturb_lambda <- function(lambda, Sigma_kernel) {
+
+  Sigma_kernel <- make_positive_definite(Sigma_kernel, min_eig = 1e-8)
+
+  v <- lambda_to_vec(lambda)
+  v_new <- as.numeric(MASS::mvrnorm(1, mu = v, Sigma = Sigma_kernel))
+  names(v_new) <- names(v)
+
+  vec_to_lambda(v_new)
+}
+
+# Gaussian proposal density from the old particle to the new one
+kernel_density <- function(lambda_new, lambda_old, Sigma_kernel) {
+  x <- lambda_to_vec(lambda_new)
+  m <- lambda_to_vec(lambda_old)
+  exp(mvnorm_logpdf(x, m, Sigma_kernel))
+}
+
+# Diagnostics
+effective_sample_size <- function(w) {
+  1 / sum(w^2)
+}
+
+# ABC_SMC procedure
+abc_smc <- function(S_obs, N, J, K, W, T_pop, alpha_quantile, pilot_size) {
+
+  populations <- vector("list", T_pop)
+  eps_vec <- numeric(T_pop)
+
+  # Population 1: Initial Rejection Sampling
+  cat("Population 1\n")
+
+  # Pilot simulations to determine epsilon_1
+  d_store <- numeric(pilot_size)
+
+  for (m in seq_len(pilot_size)) {
+
+    th <- sample_lambda()
+    out_sim <- simulate_X_from_lambda(th, N, J, K)
+    d_now <- distance_abc(summaries(out_sim$X), S_obs)
+
+    d_store[m] <- d_now
+  }
+
+  eps_vec[1] <- as.numeric(quantile(d_store, probs = alpha_quantile, na.rm = TRUE))
+
+  cat("epsilon_1 =", eps_vec[1], "\n")
+
+  # Generate population 1
+  particles <- vector("list", W)
+  distances <- numeric(W)
+
+  n_accept <- 0
+  total_prop_1 <- 0
+
+  while (n_accept < W) {
+
+    th <- sample_lambda()
+    out_sim <- simulate_X_from_lambda(th, N, J, K)
+    d_now <- distance_abc(summaries(out_sim$X), S_obs)
+
+    total_prop_1 <- total_prop_1 + 1
+
+    if (d_now <= eps_vec[1]) {
+      n_accept <- n_accept + 1
+      particles[[n_accept]] <- th
+      distances[n_accept] <- d_now
+    }
+  }
+
+  weights <- rep(1 / W, W)
+
+  populations[[1]] <- list(
+    particles = particles,
+    weights = weights,
+    distances = distances,
+    distances_for_epsilon = distances,
+    epsilon = eps_vec[1],
+    proposals = total_prop_1,
+    ESS = effective_sample_size(weights)
+  )
+
+  cat(
+    "accepted =", W,
+    " proposals =", total_prop_1,
+    " ESS =", effective_sample_size(weights),
+    "\n"
+  )
+
+  # Populations 2 to T_pop
+  if (T_pop >= 2) {
+
+    for (t in 2:T_pop) {
+
+      cat("Population", t, "\n")
+
+      prev_particles <- populations[[t - 1]]$particles
+      prev_weights <- populations[[t - 1]]$weights
+      prev_distances <- populations[[t - 1]]$distances_for_epsilon
+
+      eps_vec[t] <- as.numeric(quantile(prev_distances, probs = alpha_quantile, na.rm = TRUE))
+
+      cat(paste0("epsilon_", t, " = "), eps_vec[t], "\n")
+
+      # Construct the Gaussian perturbation kernel
+      prev_mat <- do.call(rbind, lapply(prev_particles, lambda_to_vec))
+      Sigma_kernel <- 2 * weighted_covariance(prev_mat, prev_weights)
+      Sigma_kernel <- make_positive_definite(Sigma_kernel, min_eig = 1e-8)
+
+      particles_t <- vector("list", W)
+      distances_t <- numeric(W)
+      weights_t <- numeric(W)
+
+      n_accept <- 0
+      total_prop_t <- 0
+
+      while (n_accept < W) {
+
+        # Select and perturb a previous particle
+        idx <- sample(seq_len(W), size = 1, prob = prev_weights)
+        th_star <- perturb_lambda(prev_particles[[idx]], Sigma_kernel)
+        total_prop_t <- total_prop_t + 1
+
+        if (!in_prior_support(th_star)) {
+          next
+        }
+
+        # Simulate and calculate ABC distance
+        out_sim <- simulate_X_from_lambda(th_star, N, J, K)
+        d_now <- distance_abc(summaries(out_sim$X), S_obs)
+
+        if (d_now <= eps_vec[t]) {
+
+          num <- prior_density(th_star)
+          denom <- sum(prev_weights * sapply(prev_particles, function(old) {
+            kernel_density(th_star, old, Sigma_kernel)
+          }))
+
+          if (
+            !is.finite(num) || num <= 0 ||
+            !is.finite(denom) || denom <= 0
+          ) {
+            next
+          }
+
+          n_accept <- n_accept + 1
+          particles_t[[n_accept]] <- th_star
+          distances_t[n_accept] <- d_now
+          weights_t[n_accept] <- num / denom
+        }
+      }
+
+      # Normalize importance weights
+      weights_t <- weights_t / sum(weights_t)
+      ess_t <- effective_sample_size(weights_t)
+
+      # Resample particles and corresponding distances
+      accepted_distances_t <- distances_t
+      if (ess_t < W / 2) {
+
+        idx_resample <- sample(seq_len(W), size = W, replace = TRUE, prob = weights_t)
+        particles_t <- particles_t[idx_resample]
+        distances_t <- distances_t[idx_resample]
+        weights_t <- rep(1 / W, W)
+
+        ess_t <- effective_sample_size(weights_t)
+      }
+
+      populations[[t]] <- list(
+        particles = particles_t,
+        weights = weights_t,
+        distances = distances_t,
+        distances_for_epsilon = accepted_distances_t,
+        epsilon = eps_vec[t],
+        proposals = total_prop_t,
+        Sigma_kernel = Sigma_kernel,
+        ESS = ess_t
+      )
+
+      cat(
+        "accepted =", W,
+        " proposals =", total_prop_t,
+        " ESS =", ess_t,
+        "\n"
+      )
+    }
+  }
+
+  list(
+    populations = populations,
+    eps_vec = eps_vec
+  )
+}
+```
+
+```{r}
+# Number of cells / genes / TFs
+N_use <- nrow(X_obs)
+J_use <- ncol(X_obs)
+
+# Target accepted samples per population
+W <- 200
+
+# Number of ABC-SMC populations
+T_pop <- 5
+
+# Quantile used to update tolerances
+alpha_quantile <- 0.25
+
+# run ABC-SMC
+smc_fit <- abc_smc(S_obs = S_obs, N = N_use, J = J_use, K = K_use, W = W, 
+                   T_pop = T_pop, alpha_quantile = alpha_quantile, pilot_size = 2000)
+
+# True prior sample for prior-vs-posterior plots
+prior_size <- 2000
+
+prior_draws <- lapply(1:prior_size, function(m) {
+  lambda <- sample_lambda()
+  c(theta = lambda$theta, gamma = lambda$gamma, rho = lambda$rho, alpha = lambda$alpha, 
+    sigma2 = lambda$sigma2, alpha_phi = lambda$alpha_phi, beta_phi = lambda$beta_phi, 
+    alpha_psi = lambda$alpha_psi, beta_psi = lambda$beta_psi)
+})
+
+prior_df <- as.data.frame(do.call(rbind, prior_draws))
+
+# Final ABC-SMC population as posterior
+last_pop <- smc_fit$populations[[T_pop]]
+theta_acc <- last_pop$particles
+w_acc <- last_pop$weights
+d_acc <- last_pop$distances
+
+if (any(abs(w_acc - 1 / length(w_acc)) > 1e-12)) {
+  idx_post <- sample(seq_along(theta_acc), size = length(theta_acc),
+                     replace = TRUE, prob = w_acc)
+
+  theta_acc <- theta_acc[idx_post]
+  d_acc <- d_acc[idx_post]
+}
+
+w_acc <- rep(1 / length(theta_acc), length(theta_acc))
+
+post_df <- do.call(
+  rbind,
+  lapply(theta_acc, function(lambda) {
+    c(
+      theta = lambda$theta,
+      gamma = lambda$gamma,
+      rho = lambda$rho,
+      alpha = lambda$alpha,
+      sigma2 = lambda$sigma2,
+      alpha_phi = lambda$alpha_phi,
+      beta_phi = lambda$beta_phi,
+      alpha_psi = lambda$alpha_psi,
+      beta_psi = lambda$beta_psi
+    )
+  })
+)
+post_df <- as.data.frame(post_df)
+post_df$w <- w_acc
+post_df$d <- d_acc
+
+cat("Prior size =", nrow(prior_df), "\n")
+cat("Posterior size =", nrow(post_df), "\n")
+```
+
+```{r}
+# Prior vs Posterior plots
+op <- par(no.readonly = TRUE)
+
+# Page 1: theta, log(gamma), log(rho)
+par(mfrow = c(3, 2), mar = c(4, 4, 2.5, 1))
+
+# 1) theta
+x_theta_prior <- prior_df$theta
+x_theta_post <- post_df$theta
+xlim_theta <- range(c(x_theta_prior, x_theta_post), finite = TRUE)
+br_theta <- seq(xlim_theta[1], xlim_theta[2], length.out = 61)
+
+hist(x_theta_prior, breaks = br_theta, probability = TRUE,
+     main = "Prior: gene_on probability (theta)", xlab = "theta", xlim = xlim_theta)
+hist(x_theta_post,  breaks = br_theta, probability = TRUE,
+     main = "Posterior: theta", xlab = "theta", xlim = xlim_theta)
+
+# 2) log(gamma)
+x_lg_prior <- log(prior_df$gamma)
+x_lg_post <- log(post_df$gamma)
+xlim_lgamma <- range(c(x_lg_prior, x_lg_post), finite = TRUE)
+br_lgamma <- seq(xlim_lgamma[1], xlim_lgamma[2], length.out = 61)
+
+hist(x_lg_prior, breaks = br_lgamma, probability = TRUE,
+     main = "Prior: biological variability log(gamma)", xlab = "log(gamma)", xlim = xlim_lgamma)
+hist(x_lg_post, breaks = br_lgamma, probability = TRUE,
+     main = "Posterior: log(gamma)", xlab = "log(gamma)", xlim = xlim_lgamma)
+
+# 3) log(rho)
+x_lr_prior <- log(prior_df$rho)
+x_lr_post <- log(post_df$rho)
+xlim_lrho <- range(c(x_lr_prior, x_lr_post), finite = TRUE)
+br_lrho <- seq(xlim_lrho[1], xlim_lrho[2], length.out = 61)
+
+hist(x_lr_prior, breaks = br_lrho, probability = TRUE,
+     main = "Prior: technical noise log(rho)", xlab = "log(rho)", xlim = xlim_lrho)
+hist(x_lr_post,  breaks = br_lrho, probability = TRUE,
+     main = "Posterior: log(rho)", xlab = "log(rho)", xlim = xlim_lrho)
+
+# Page 2: log(alpha), log(sigma2), log(alpha_phi)
+par(mfrow = c(3, 2), mar = c(4, 4, 2.5, 1))
+
+# 4) log(alpha)
+x_la_prior <- log(prior_df$alpha)
+x_la_post <- log(post_df$alpha)
+xlim_lalpha <- range(c(x_la_prior, x_la_post), finite = TRUE)
+br_lalpha <- seq(xlim_lalpha[1], xlim_lalpha[2], length.out = 61)
+
+hist(x_la_prior, breaks = br_lalpha, probability = TRUE,
+     main = "Prior: TF activity variability log(alpha)", xlab = "log(alpha)", xlim = xlim_lalpha)
+hist(x_la_post, breaks = br_lalpha, probability = TRUE,
+     main = "Posterior: log(alpha)", xlab = "log(alpha)", xlim = xlim_lalpha)
+
+# 5) log(sigma2)
+x_ls_prior <- log(prior_df$sigma2)
+x_ls_post <- log(post_df$sigma2)
+xlim_lsigma2 <- range(c(x_ls_prior, x_ls_post), finite = TRUE)
+br_lsigma2 <- seq(xlim_lsigma2[1], xlim_lsigma2[2], length.out = 61)
+
+hist(x_ls_prior, breaks = br_lsigma2, probability = TRUE,
+     main = "Prior: Regulatory effect variance log(sigma2)",
+     xlab = "log(sigma2)", xlim = xlim_lsigma2)
+hist(x_ls_post, breaks = br_lsigma2, probability = TRUE,
+     main = "Posterior: log(sigma2)", xlab = "log(sigma2)", xlim = xlim_lsigma2)
+
+# 6) log(alpha_phi)
+x_lalpha_phi_prior <- log(prior_df$alpha_phi)
+x_lalpha_phi_post <- log(post_df$alpha_phi)
+xlim_lalpha_phi <- range(c(x_lalpha_phi_prior, x_lalpha_phi_post), finite = TRUE)
+br_lalpha_phi <- seq(xlim_lalpha_phi[1], xlim_lalpha_phi[2], length.out = 61)
+
+hist(x_lalpha_phi_prior, breaks = br_lalpha_phi, probability = TRUE,
+     main = "Prior: Target Beta shape log(alpha_phi)", xlab = "log(alpha_phi)", 
+     xlim = xlim_lalpha_phi)
+hist(x_lalpha_phi_post, breaks = br_lalpha_phi, probability = TRUE,
+     main = "Posterior: log(alpha_phi)", xlab = "log(alpha_phi)", xlim = xlim_lalpha_phi)
+
+# Page 3: log(beta_phi), log(alpha_psi), log(beta_psi)
+par(mfrow = c(3, 2), mar = c(4, 4, 2.5, 1))
+
+# 7) log(beta_phi)
+x_lbeta_phi_prior <- log(prior_df$beta_phi)
+x_lbeta_phi_post <- log(post_df$beta_phi)
+xlim_lbeta_phi <- range(c(x_lbeta_phi_prior, x_lbeta_phi_post), finite = TRUE)
+br_lbeta_phi <- seq(xlim_lbeta_phi[1], xlim_lbeta_phi[2], length.out = 61)
+
+hist(x_lbeta_phi_prior, breaks = br_lbeta_phi, probability = TRUE,
+     main = "Prior: Target Beta shape log(beta_phi)", xlab = "log(beta_phi)", xlim = xlim_lbeta_phi)
+hist(x_lbeta_phi_post, breaks = br_lbeta_phi, probability = TRUE,
+     main = "Posterior: log(beta_phi)", xlab = "log(beta_phi)", xlim = xlim_lbeta_phi)
+
+# 8) log(alpha_psi)
+x_lalpha_psi_prior <- log(prior_df$alpha_psi)
+x_lalpha_psi_post <- log(post_df$alpha_psi)
+xlim_lalpha_psi <- range(c(x_lalpha_psi_prior, x_lalpha_psi_post), finite = TRUE)
+br_lalpha_psi <- seq(xlim_lalpha_psi[1], xlim_lalpha_psi[2], length.out = 61)
+
+hist(x_lalpha_psi_prior, breaks = br_lalpha_psi, probability = TRUE,
+     main = "Prior: Regulator Beta shape log(alpha_psi)", xlab = "log(alpha_psi)", xlim = xlim_lalpha_psi)
+hist(x_lalpha_psi_post, breaks = br_lalpha_psi, probability = TRUE,
+     main = "Posterior: log(alpha_psi)", xlab = "log(alpha_psi)", xlim = xlim_lalpha_psi)
+
+# 9) log(beta_psi)
+x_lbeta_psi_prior <- log(prior_df$beta_psi)
+x_lbeta_psi_post <- log(post_df$beta_psi)
+xlim_lbeta_psi <- range(c(x_lbeta_psi_prior, x_lbeta_psi_post), finite = TRUE)
+br_lbeta_psi <- seq(xlim_lbeta_psi[1], xlim_lbeta_psi[2], length.out = 61)
+
+hist(x_lbeta_psi_prior, breaks = br_lbeta_psi, probability = TRUE,
+     main = "Prior: Regulator Beta shape log(beta_psi)",
+     xlab = "log(beta_psi)", xlim = xlim_lbeta_psi)
+hist(x_lbeta_psi_post, breaks = br_lbeta_psi, probability = TRUE,
+     main = "Posterior: log(beta_psi)", xlab = "log(beta_psi)", xlim = xlim_lbeta_psi)
+
+par(op)
+```
+
+```{r}
+# Posterior predictive (latent layers)
+# Simulate from all accepted posterior thetas from the final ABC-SMC population
+R_post <- length(theta_acc)
+out_pp_list <- vector("list", R_post)
+
+for (r in 1:R_post) {
+  th_r <- theta_acc[[r]]
+  out_pp_list[[r]] <- simulate_X_from_lambda(th_r, N_use, J_use, K_use)
+}
+
+X_pp_list <- lapply(out_pp_list, function(o) o$X)
+
+# Latent variables
+a_vec <- unlist(lapply(out_pp_list, function(o) as.double(c(o$a))), use.names = FALSE)
+delta_vec <- unlist(lapply(out_pp_list, function(o) as.integer(c(o$delta))), use.names = FALSE)
+beta_vec <- unlist(lapply(out_pp_list, function(o) as.double(c(o$beta))), use.names = FALSE)
+m_vec <- unlist(lapply(out_pp_list, function(o) as.double(c(o$m))), use.names = FALSE)
+pi_vec <- unlist(lapply(out_pp_list, function(o) as.double(o$pi_j)), use.names = FALSE)
+phi_j_vec <- unlist(lapply(out_pp_list, function(o) as.double(o$phi_j)), use.names = FALSE)
+psi_k_vec <- unlist(lapply(out_pp_list, function(o) as.double(o$psi_k)), use.names = FALSE)
+v_vec <- unlist(lapply(out_pp_list, function(o) as.integer(c(o$v))), use.names = FALSE)
+z_vec <- unlist(lapply(out_pp_list, function(o) as.double(c(o$z))), use.names = FALSE)
+t_vec <- unlist(lapply(out_pp_list, function(o) as.double(c(o$t))), use.names = FALSE)
+
+# 1) a_ik
+a_vec <- a_vec[is.finite(a_vec)]
+xr_a <- range(a_vec, na.rm = TRUE)
+br_a <- seq(xr_a[1], xr_a[2], length.out = 101)
+
+ggplot(data.frame(v = a_vec), aes(x = v)) +
+  geom_histogram(aes(y = after_stat(count / sum(count))),
+                 breaks = br_a, alpha = 0.4) +
+  coord_cartesian(xlim = xr_a) +
+  labs(title = "a_ik (TF activities)",
+       x = "a_ik", y = "Probability") +
+  theme_minimal()
+
+# 2) delta_kj
+delta_vec <- delta_vec[is.finite(delta_vec)]
+tab_delta <- table(factor(delta_vec, levels = c(0, 1)))
+df_delta <- data.frame(val = c("0", "1"), prob = as.numeric(tab_delta) / sum(tab_delta))
+
+ggplot(df_delta, aes(x = val, y = prob)) +
+  geom_col(alpha = 0.6) +
+  labs(title = "delta_kj (adjacency)",
+       x = "delta_kj", y = "Probability") +
+  theme_minimal()
+
+# 3) beta_kj
+beta_vec <- beta_vec[is.finite(beta_vec)]
+beta_nz <- beta_vec[beta_vec != 0]
+xr_b <- range(beta_vec, na.rm = TRUE)
+br_b <- seq(xr_b[1], xr_b[2], length.out = 101)
+
+ggplot(data.frame(v = beta_vec), aes(x = v)) +
+  geom_histogram(aes(y = after_stat(count / sum(count))),
+                 breaks = br_b, alpha = 0.4) +
+  coord_cartesian(xlim = xr_b) +
+  labs(title = "beta_kj (regulatory effect)",
+       x = "beta_kj", y = "Probability") +
+  theme_minimal()
+
+# beta_kj (nonzero)
+if (length(beta_nz) > 0) {
+  xr_bnz <- range(beta_nz, na.rm = TRUE)
+  br_bnz <- seq(xr_bnz[1], xr_bnz[2], length.out = 101)
+
+  ggplot(data.frame(v = beta_nz), aes(x = v)) +
+    geom_histogram(aes(y = after_stat(count / sum(count))),
+                   breaks = br_bnz, alpha = 0.4) +
+    coord_cartesian(xlim = xr_bnz) +
+    labs(title = "beta_kj (nonzero) (regulatory effect)",
+         x = "beta_kj | != 0", y = "Probability") +
+    theme_minimal()
+}
+
+# 4) m_ij
+m_vec <- m_vec[is.finite(m_vec)]
+xr_m <- range(m_vec, na.rm = TRUE)
+br_m <- seq(xr_m[1], xr_m[2], length.out = 101)
+
+ggplot(data.frame(v = m_vec), aes(x = v)) +
+  geom_histogram(aes(y = after_stat(count / sum(count))),
+                 breaks = br_m, alpha = 0.4) +
+  coord_cartesian(xlim = xr_m) +
+  labs(title = "m_ij (regulatory mean)",
+       x = "m_ij", y = "Probability") +
+  theme_minimal()
+
+# 5) pi_j
+pi_vec <- pi_vec[is.finite(pi_vec)]
+xr_p <- range(pi_vec, na.rm = TRUE)
+br_p <- seq(xr_p[1], xr_p[2], length.out = 61)
+
+ggplot(data.frame(v = pi_vec), aes(x = v)) +
+  geom_histogram(aes(y = after_stat(count / sum(count))),
+                 breaks = br_p, alpha = 0.4) +
+  coord_cartesian(xlim = xr_p) +
+  labs(title = "pi_j (gene on-probability)",
+       x = "pi_j", y = "Probability") +
+  theme_minimal()
+
+# 6) phi_j
+phi_j_vec <- phi_j_vec[is.finite(phi_j_vec)]
+
+ggplot(data.frame(v = phi_j_vec), aes(x = v)) +
+  geom_histogram(
+    aes(y = after_stat(count / sum(count))),
+    breaks = seq(0, 1, length.out = 61),
+    alpha = 0.4
+  ) +
+  coord_cartesian(xlim = c(0, 1)) +
+  labs(
+    title = "phi_j (gene-specific edge propensity)",
+    x = "phi_j",
+    y = "Probability"
+  ) +
+  theme_minimal()
+
+# 7) psi_k
+psi_k_vec <- psi_k_vec[is.finite(psi_k_vec)]
+
+ggplot(data.frame(v = psi_k_vec), aes(x = v)) +
+  geom_histogram(
+    aes(y = after_stat(count / sum(count))),
+    breaks = seq(0, 1, length.out = 61),
+    alpha = 0.4
+  ) +
+  coord_cartesian(xlim = c(0, 1)) +
+  labs(
+    title = "psi_k (regulator-specific edge propensity)",
+    x = "psi_k",
+    y = "Probability"
+  ) +
+  theme_minimal()
+
+# 8) v_ij bar plot
+v_vec <- v_vec[is.finite(v_vec)]
+tab_v <- table(factor(v_vec, levels = c(0, 1)))
+df_v <- data.frame(val = c("0", "1"), prob = as.numeric(tab_v) / sum(tab_v))
+
+ggplot(df_v, aes(x = val, y = prob)) +
+  geom_col(alpha = 0.6) +
+  labs(title = "v_ij (on/off)",
+       x = "v_ij", y = "Probability") +
+  theme_minimal()
+
+# 9) z_ij
+z_vec <- z_vec[is.finite(z_vec)]
+xr_z <- range(z_vec, na.rm = TRUE)
+br_z <- seq(xr_z[1], xr_z[2], length.out = 101)
+
+ggplot(data.frame(v = z_vec), aes(x = v)) +
+  geom_histogram(aes(y = after_stat(count / sum(count))),
+                 breaks = br_z, alpha = 0.4) +
+  coord_cartesian(xlim = xr_z) +
+  labs(title = "z_ij (latent expression)",
+       x = "z_ij", y = "Probability") +
+  theme_minimal()
+
+# 10) t_ij
+t_vec <- t_vec[is.finite(t_vec)]
+xr_t <- range(t_vec, na.rm = TRUE)
+br_t <- seq(xr_t[1], xr_t[2], length.out = 101)
+
+ggplot(data.frame(v = t_vec), aes(x = v)) +
+  geom_histogram(aes(y = after_stat(count / sum(count))),
+                 breaks = br_t, alpha = 0.4) +
+  coord_cartesian(xlim = xr_t) +
+  labs(title = "t_ij (technical multiplicative noise)",
+       x = "t_ij", y = "Probability") +
+  theme_minimal()
+```
+
+```{r}
+# Posterior predictive distributions
+# Entrywise vectors
+x_obs_vec <- as.numeric(X_obs)
+x_sim_vec <- unlist(lapply(X_pp_list, as.numeric), use.names = FALSE)
+
+x_obs_nonzero <- x_obs_vec[x_obs_vec > 0]
+x_sim_nonzero <- x_sim_vec[x_sim_vec > 0]
+
+# Cell-level summaries
+C_obs <- Matrix::rowSums(X_obs) / ncol(X_obs)
+D_obs <- Matrix::rowSums(X_obs > 0) / ncol(X_obs)
+
+C_sim <- unlist(lapply(X_pp_list, function(X) Matrix::rowSums(X) / ncol(X)), use.names = FALSE)
+D_sim <- unlist(lapply(X_pp_list, function(X) Matrix::rowSums(X > 0) / ncol(X)), use.names = FALSE)
+
+# Gene-level summaries
+G_obs <- Matrix::colSums(X_obs) / nrow(X_obs)
+M_obs <- Matrix::colSums(X_obs > 0) / nrow(X_obs)
+
+G_sim <- unlist(lapply(X_pp_list, function(X) Matrix::colSums(X) / nrow(X)), use.names = FALSE)
+M_sim <- unlist(lapply(X_pp_list, function(X) Matrix::colSums(X > 0) / nrow(X)), use.names = FALSE)
+
+# Plot function
+make_page_2x2_facet <- function(obs, sim, title_base, xlab_raw, xlab_log, bins = 100) {
+
+  # log10(1+x) axis transform
+  log10p1_trans <- scales::trans_new(
+    name = "log10p1",
+    transform = function(x) log10(x + 1),
+    inverse = function(x) 10^x - 1,
+    domain = c(-1 + 1e-12, Inf)
+  )
+
+  obs <- as.numeric(obs)
+  sim <- as.numeric(sim)
+  x_min <- min(c(obs, sim), na.rm = TRUE)
+  x_max <- max(c(obs, sim), na.rm = TRUE)
+
+  # histogram breaks
+  br_raw <- seq(x_min, x_max, length.out = bins + 1)
+  br_log_raw <- (10^seq(log10(1 + x_min), log10(1 + x_max), length.out = bins + 1)) - 1
+
+  # axis ticks
+  breaks_raw <- sort(unique(c(x_min, pretty(c(x_min, x_max), n = 5))))
+  breaks_raw <- breaks_raw[breaks_raw >= x_min & breaks_raw <= x_max]
+
+  log_min <- log10(1 + x_min); log_max <- log10(1 + x_max)
+  breaks_log_space <- pretty(c(log_min, log_max), n = 5)
+  breaks_log_raw <- (10^breaks_log_space) - 1
+  breaks_log_raw <- sort(unique(c(x_min, breaks_log_raw)))
+  breaks_log_raw <- breaks_log_raw[breaks_log_raw >= x_min & breaks_log_raw <= x_max]
+
+  # probability
+  hist_rect_df <- function(v, breaks, source) {
+    h <- hist(v, breaks = breaks, plot = FALSE, right = FALSE)
+    p <- if (sum(h$counts) > 0) h$counts / sum(h$counts) else rep(0, length(h$counts))
+    data.frame(
+      xmin = h$breaks[-length(h$breaks)],
+      xmax = h$breaks[-1],
+      prob = p,
+      source = factor(source, levels = c("Observed", "Simulated"))
+    )
+  }
+
+  df_raw <- rbind(
+    hist_rect_df(obs, br_raw, "Observed"),
+    hist_rect_df(sim, br_raw, "Simulated")
+  )
+
+  df_log <- rbind(
+    hist_rect_df(obs, br_log_raw, "Observed"),
+    hist_rect_df(sim, br_log_raw, "Simulated")
+  )
+
+  ymax_raw <- max(df_raw$prob, na.rm = TRUE)
+  ymax_log <- max(df_log$prob, na.rm = TRUE)
+
+  p_raw <- ggplot2::ggplot(df_raw) +
+    ggplot2::geom_rect(ggplot2::aes(xmin = xmin, xmax = xmax, ymin = 0, ymax = prob), 
+                       alpha = 0.4) +
+    ggplot2::facet_grid(rows = ggplot2::vars(source), axes = "all", axis.labels = "all") +
+    ggplot2::scale_x_continuous(
+      limits = c(x_min, x_max),
+      breaks = breaks_raw,
+      labels = scales::label_number(big.mark = ","),
+      expand = c(0, 0)
+    ) +
+    ggplot2::scale_y_continuous(
+      breaks = function(lim) pretty(lim, n = 5),
+      labels = scales::label_number(accuracy = 0.01),
+      expand = c(0, 0)
+    ) +
+    ggplot2::coord_cartesian(ylim = c(0, ymax_raw)) +
+    ggplot2::labs(title = paste0("RAW ", title_base), x = xlab_raw, y = "Probability") +
+    ggplot2::theme_minimal()
+
+  p_log <- ggplot2::ggplot(df_log) +
+    ggplot2::geom_rect(ggplot2::aes(xmin = xmin, xmax = xmax, ymin = 0, ymax = prob), alpha = 0.4) +
+    ggplot2::facet_grid(rows = ggplot2::vars(source), axes = "all", axis.labels = "all") +
+    ggplot2::scale_x_continuous(
+      limits = c(x_min, x_max),
+      trans  = log10p1_trans,
+      breaks = breaks_log_raw,
+      labels = scales::label_number(big.mark = ","),
+      expand = c(0, 0)
+    ) +
+    ggplot2::scale_y_continuous(
+      breaks = function(lim) pretty(lim, n = 5),
+      labels = scales::label_number(accuracy = 0.01),
+      expand = c(0, 0)
+    ) +
+    ggplot2::coord_cartesian(ylim = c(0, ymax_log)) +
+    ggplot2::labs(title = paste0("LOG ", title_base), x = xlab_log, y = "Probability") +
+    ggplot2::theme_minimal()
+
+  gridExtra::grid.arrange(p_raw, p_log, ncol = 2)
+}
+
+# 1) Entrywise all entries
+make_page_2x2_facet(
+  obs = x_obs_vec,
+  sim = x_sim_vec,
+  title_base = "Entrywise: counts (all)",
+  xlab_raw = "X_ij",
+  xlab_log = "X_ij",
+  bins = 100
+)
+
+# 2) Entrywise positive entries only
+make_page_2x2_facet(
+  obs = x_obs_nonzero,
+  sim = x_sim_nonzero,
+  title_base = "Entrywise: counts (positive)",
+  xlab_raw = "X_ij | X_ij > 0",
+  xlab_log = "X_ij | X_ij > 0",
+  bins = 100
+)
+
+# 3) Cell-level mean UMI per gene
+make_page_2x2_facet(
+  obs = as.numeric(C_obs),
+  sim = as.numeric(C_sim),
+  title_base = "Cell-level: mean UMI per gene",
+  xlab_raw = "(1/J) sum_j X_ij",
+  xlab_log = "(1/J) sum_j X_ij",
+  bins = 100
+)
+
+# 4) Cell-level fraction detected genes
+make_page_2x2_facet(
+  obs = as.numeric(D_obs),
+  sim = as.numeric(D_sim),
+  title_base = "Cell-level: fraction detected genes",
+  xlab_raw = "(1/J) sum_j 1{X_ij > 0}",
+  xlab_log = "(1/J) sum_j 1{X_ij > 0}",
+  bins = 100
+)
+
+# 5) Gene-level mean UMI per cell
+make_page_2x2_facet(
+  obs = as.numeric(G_obs),
+  sim = as.numeric(G_sim),
+  title_base = "Gene-level: mean UMI per cell",
+  xlab_raw = "(1/N) sum_i X_ij",
+  xlab_log = "(1/N) sum_i X_ij",
+  bins = 100
+)
+
+# 6) Gene-level fraction expressing cells
+make_page_2x2_facet(
+  obs = as.numeric(M_obs),
+  sim = as.numeric(M_sim),
+  title_base = "Gene-level: fraction expressing cells",
+  xlab_raw = "(1/N) sum_i 1{X_ij > 0}",
+  xlab_log = "(1/N) sum_i 1{X_ij > 0}",
+  bins = 100
+)
+```
+
+```{r}
+range(x_obs_vec, finite = TRUE)
+range(x_sim_vec, finite = TRUE)
+```
